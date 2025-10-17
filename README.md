@@ -16,6 +16,12 @@ $ docker build -t datamario24/sc-user-svc:0.1.0 .
 $ docker push datamario24/sc-user-svc:0.1.0
 ```
 
+# STRESS TEST
+- /hello2
+```bash
+$ CPU_STRESS_NUMBER=50000 ./gradlew clean bootRun 
+```
+
 # Use Compose
 ```
 services:
