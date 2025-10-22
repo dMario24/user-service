@@ -42,32 +42,58 @@ jobs:
         target: '/home/${{ secrets.AWS_EC2_USER }}/app/' # EC2에 전송할 경로
         
     - name: Restart application on EC2 via SSH
-      uses: appleboy/ssh-action@v1.0.1
-      with:
-        host: ${{ secrets.AWS_EC2_HOST }}
-        username: ${{ secrets.AWS_EC2_USER }}
-        key: ${{ secrets.AWS_EC2_SSH_KEY }}
-        port: 22
-        script: |
-          # 6. EC2 인스턴스에서 실행할 스크립트
-          APP_NAME=$(basename /home/${{ secrets.AWS_EC2_USER }}/app/*.jar)
-          APP_PATH="/home/${{ secrets.AWS_EC2_USER }}/app/$APP_NAME"
-          
-          # 7. 기존 애플리케이션 프로세스 찾아서 종료
-          # 'grep -v grep'은 자기 자신 프로세스를 제외하기 위함
-          # 'awk "{print \$2}"' 는 PID(프로세스 ID)만 추출
-          CURRENT_PID=$(ps -ef | grep $APP_NAME | grep -v grep | awk '{print $2}')
-          
-          if [ -z "$CURRENT_PID" ]; then
-            echo "> 기존 프로세스가 없습니다."
-          else
-            echo "> kill -15 $CURRENT_PID"
-            kill -15 $CURRENT_PID
-            sleep 5 # 프로세스가 완전히 종료될 때까지 대기
-          fi
-          
-          # 8. 새 Jar 파일로 애플리케이션 재시작 (nohup을 사용해 세션 종료 후에도 실행 유지)
-          echo "> 새 애플리케이션 시작: $APP_PATH"
-          #nohup java -jar $APP_PATH > /dev/null 2>&1 &
-          nohup java -jar $APP_PATH > /home/${{ secrets.AWS_EC2_USER }}/app/app.log 2>&1 &
-          echo "> 새 애플리케이션 시작 완료."
+  uses: appleboy/ssh-action@v1.0.1
+  with:
+    host: ${{ secrets.AWS_EC2_HOST }}
+    username: ${{ secrets.AWS_EC2_USER }}
+    key: ${{ secrets.AWS_EC2_SSH_KEY }}
+    port: 22
+    script: |
+      set -e
+
+      REMOTE_USER="${{ secrets.AWS_EC2_USER }}"
+      REMOTE_APP_DIR="/home/${REMOTE_USER}/app"
+      LOG_FILE="$REMOTE_APP_DIR/app.log"
+
+      # 1) 최신 JAR 파일 찾기 (하위 폴더 포함)
+      APP_PATH=$(find "$REMOTE_APP_DIR" -type f -name "*.jar" -print0 | xargs -0 ls -1t 2>/dev/null | head -n1 || true)
+
+      if [ -z "$APP_PATH" ]; then
+        echo "> JAR 파일을 찾지 못했습니다. ($REMOTE_APP_DIR 하위 확인)"
+        ls -al "$REMOTE_APP_DIR"
+        exit 1
+      fi
+
+      echo "> 찾아진 JAR: $APP_PATH"
+
+      # 2) JAR을 app 루트로 이동(선택) — 이름은 그대로 유지
+      BASENAME=$(basename "$APP_PATH")
+      if [ "$APP_PATH" != "$REMOTE_APP_DIR/$BASENAME" ]; then
+        echo "> $APP_PATH 를 $REMOTE_APP_DIR/$BASENAME 로 이동합니다."
+        mv "$APP_PATH" "$REMOTE_APP_DIR/$BASENAME"
+        APP_PATH="$REMOTE_APP_DIR/$BASENAME"
+      fi
+
+      # 3) 기존 프로세스 종료 (path 기준)
+      CURRENT_PID=$(pgrep -f "$APP_PATH" || true)
+      if [ -n "$CURRENT_PID" ]; then
+        echo "> 기존 프로세스 종료: $CURRENT_PID"
+        kill -15 $CURRENT_PID || true
+        sleep 5
+      else
+        echo "> 기존 프로세스 없음"
+      fi
+
+      # 4) 시작 (로그 남기기)
+      echo "> 새 애플리케이션 시작: $APP_PATH"
+      nohup java -jar "$APP_PATH" >> "$LOG_FILE" 2>&1 &
+
+      sleep 3
+
+      if pgrep -f "$APP_PATH" > /dev/null; then
+        echo "> 애플리케이션 실행 성공 (PID: $(pgrep -f "$APP_PATH" | head -n1))"
+      else
+        echo "> 애플리케이션 실행 실패 — 마지막 로그 100줄:"
+        tail -n 100 "$LOG_FILE" || true
+        exit 1
+      fi
