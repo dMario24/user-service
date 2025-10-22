@@ -1,0 +1,132 @@
+name: Java CI/CD (Build, Deploy, Run)
+
+on:
+  push:
+    branches:
+      - stg # stg 브랜치에 push 될 때마다 실행
+
+# 빌드, 배포, 실행의 세 단계로 jobs 분리
+jobs:
+  # 1. 빌드 (JAR 파일 생성 및 Artifact 저장)
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'corretto' # Amazon Corretto (OpenJDK)
+          java-version: '17'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle (Create bootJar)
+        run: ./gradlew bootJar
+
+      # 빌드된 JAR 파일을 다음 Job으로 전달하기 위해 Artifact로 업로드
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: build/libs/*.jar
+          retention-days: 1 # Artifact 보존 기간 설정 (선택 사항)
+
+  # 2. 배포 (Artifact 다운로드 후 EC2로 SCP 전송)
+  deploy:
+    needs: [build] # build Job이 성공적으로 완료된 후에 실행
+    runs-on: ubuntu-latest
+    steps:
+      # 빌드 Job에서 저장한 Artifact 다운로드
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: ./app-artifact # 다운로드할 폴더 경로 (폴더를 지정하면 *.jar 파일이 이 안에 위치)
+
+      # SCP를 이용한 EC2 배포
+      - name: SCP Deploy to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AWS_EC2_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_EC2_SSH_KEY }}
+          port: 22
+          # 다운로드한 폴더 내의 JAR 파일을 source로 지정
+          source: 'app-artifact/*.jar' 
+          target: '/home/${{ secrets.AWS_EC2_USER }}/app/' # EC2에 전송할 경로
+
+  # 3. 실행/재시작 (SSH 접속하여 서비스 재시작 스크립트 실행)
+  run_app:
+    needs: [deploy] # deploy Job이 성공적으로 완료된 후에 실행
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restart application on EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.1
+        with:
+          host: ${{ secrets.AWS_EC2_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_EC2_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+
+            REMOTE_USER="${{ secrets.AWS_EC2_USER }}"
+            REMOTE_APP_DIR="/home/${REMOTE_USER}/app"
+            LOG_FILE="$REMOTE_APP_DIR/app.log"
+
+            # 1) 최신 JAR 파일 찾기 (하위 폴더 포함)
+            APP_PATH=$(find "$REMOTE_APP_DIR" -type f -name "*.jar" -print0 | xargs -0 ls -1t 2>/dev/null | head -n1 || true)
+
+            if [ -z "$APP_PATH" ]; then
+              echo "> JAR 파일을 찾지 못했습니다. ($REMOTE_APP_DIR 하위 확인)"
+              ls -al "$REMOTE_APP_DIR"
+              exit 1
+            fi
+
+            echo "> 찾아진 JAR: $APP_PATH"
+
+            # 2) JAR을 app 루트로 이동(선택) — 이름은 그대로 유지 (배포된 파일만 남기기 위함)
+            BASENAME=$(basename "$APP_PATH")
+            if [ "$APP_PATH" != "$REMOTE_APP_DIR/$BASENAME" ]; then
+              echo "> $APP_PATH 를 $REMOTE_APP_DIR/$BASENAME 로 이동합니다."
+              mv "$APP_PATH" "$REMOTE_APP_DIR/$BASENAME"
+              APP_PATH="$REMOTE_APP_DIR/$BASENAME"
+            fi
+
+            # 3) 기존 프로세스 종료 (path 기준)
+            CURRENT_PID=$(pgrep -f "$APP_PATH" || true)
+            if [ -n "$CURRENT_PID" ]; then
+              echo "> 기존 프로세스 종료: $CURRENT_PID"
+              kill -15 $CURRENT_PID || true
+              sleep 5
+            else
+              echo "> 기존 프로세스 없음"
+            fi
+
+            # 4) 시작 (로그 남기기)
+            echo "> 새 애플리케이션 시작: $APP_PATH"
+
+            # 환경변수 설정 (원래 스크립트의 설정을 그대로 유지)
+            export EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://172.31.35.94:8765/eureka
+            export SERVER_PORT=9001
+            export CPU_STRESS_NUMBER=500
+            export LOGGING_LEVEL_ROOT=INFO
+            export LOGGING_LEVEL_COM_EXAMPLE_USER_SERVICE=DEBUG
+            export LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_WEB=DEBUG
+            
+            # nohup으로 백그라운드에서 실행하고 로그 파일에 출력
+            nohup java -jar "$APP_PATH" >> "$LOG_FILE" 2>&1 &
+
+            sleep 3 # 애플리케이션 시작 대기
+
+            if pgrep -f "$APP_PATH" > /dev/null; then
+              echo "> 애플리케이션 실행 성공 (PID: $(pgrep -f "$APP_PATH" | head -n1))"
+            else
+              echo "> 애플리케이션 실행 실패 — 마지막 로그 100줄:"
+              tail -n 100 "$LOG_FILE" || true
+              exit 1
+            fi
+
