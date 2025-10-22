@@ -68,5 +68,6 @@ jobs:
           
           # 8. 새 Jar 파일로 애플리케이션 재시작 (nohup을 사용해 세션 종료 후에도 실행 유지)
           echo "> 새 애플리케이션 시작: $APP_PATH"
-          nohup java -jar $APP_PATH > /dev/null 2>&1 &
+          #nohup java -jar $APP_PATH > /dev/null 2>&1 &
+          nohup java -jar $APP_PATH > /home/${{ secrets.AWS_EC2_USER }}/app/app.log 2>&1 &
           echo "> 새 애플리케이션 시작 완료."
