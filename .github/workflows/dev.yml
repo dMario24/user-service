@@ -1,0 +1,72 @@
+name: Java CI/CD with SCP to EC2
+
+on:
+  push:
+    branches:
+      - dev  # dev 브랜치에 push 될 때마다 실행
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    
+    # 1. 소스 코드 체크아웃
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. Java 17 설정
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'corretto' # Amazon Corretto (OpenJDK) 권장
+        java-version: '17'
+
+    # 3. Gradle Wrapper 권한 부여 (Linux/macOS 환경)
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    # 4. Spring Boot Jar 파일 빌드
+    - name: Build with Gradle
+      run: ./gradlew bootJar
+
+    # 5. SCP를 이용한 EC2 배포 및 서비스 재시작
+    - name: Deploy to EC2 via SSH/SCP
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.AWS_EC2_HOST }}  # EC2 IP (비밀 변수)
+        username: ${{ secrets.AWS_EC2_USER }} # EC2 사용자 (비밀 변수)
+        key: ${{ secrets.AWS_EC2_SSH_KEY }} # SSH 개인 키 (비밀 변수)
+        port: 22
+        source: 'build/libs/*.jar' # 빌드된 Jar 파일 경로
+        target: '/home/${{ secrets.AWS_EC2_USER }}/app/' # EC2에 전송할 경로
+        
+    - name: Restart application on EC2 via SSH
+      uses: appleboy/ssh-action@v1.0.1
+      with:
+        host: ${{ secrets.AWS_EC2_HOST }}
+        username: ${{ secrets.AWS_EC2_USER }}
+        key: ${{ secrets.AWS_EC2_SSH_KEY }}
+        port: 22
+        script: |
+          # 6. EC2 인스턴스에서 실행할 스크립트
+          APP_NAME=$(basename /home/${{ secrets.AWS_EC2_USER }}/app/*.jar)
+          APP_PATH="/home/${{ secrets.AWS_EC2_USER }}/app/$APP_NAME"
+          
+          # 7. 기존 애플리케이션 프로세스 찾아서 종료
+          # 'grep -v grep'은 자기 자신 프로세스를 제외하기 위함
+          # 'awk "{print \$2}"' 는 PID(프로세스 ID)만 추출
+          CURRENT_PID=$(ps -ef | grep $APP_NAME | grep -v grep | awk '{print $2}')
+          
+          if [ -z "$CURRENT_PID" ]; then
+            echo "> 기존 프로세스가 없습니다."
+          else
+            echo "> kill -15 $CURRENT_PID"
+            kill -15 $CURRENT_PID
+            sleep 5 # 프로세스가 완전히 종료될 때까지 대기
+          fi
+          
+          # 8. 새 Jar 파일로 애플리케이션 재시작 (nohup을 사용해 세션 종료 후에도 실행 유지)
+          echo "> 새 애플리케이션 시작: $APP_PATH"
+          nohup java -jar $APP_PATH > /dev/null 2>&1 &
+          echo "> 새 애플리케이션 시작 완료."
